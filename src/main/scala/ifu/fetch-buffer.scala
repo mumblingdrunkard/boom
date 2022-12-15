@@ -121,6 +121,69 @@ class FetchBuffer(implicit p: Parameters) extends BoomModule
       in_uops(i).bp_xcpt_if     := io.enq.bits.bp_xcpt_if_oh(i)
 
       in_uops(i).debug_fsrc     := io.enq.bits.fsrc
+      in_uops(i).tea_psv.itlb_pmiss     := false.B
+      in_uops(i).tea_psv.itlb_smiss     := false.B
+      in_uops(i).tea_psv.icache_miss    := false.B
+      in_uops(i).tea_psv.memory_order_xcpt := false.B
+    }
+  }
+
+  // Fill in miss information to the first instruction from the fetch bundle
+  when(in_mask.reduce(_||_)) {
+    val firstValid = PriorityEncoder(in_mask)
+    in_uops(firstValid).tea_psv.icache_miss := io.enq.bits.icache_miss
+    in_uops(firstValid).tea_psv.itlb_pmiss := io.enq.bits.itlb_pmiss
+    in_uops(firstValid).tea_psv.itlb_smiss := io.enq.bits.itlb_smiss
+    in_uops(firstValid).tea_psv.memory_order_xcpt := io.enq.bits.memory_order_xcpt
+  }
+
+  // It can happen that a previous fetch bundle carries a
+  // iTLB or iCache miss event but no valid instruction
+  // If the fist instruction of the next fetch bundle is an
+  // edge instruction it might inherit the miss information
+  val edge_icache_miss = RegInit(false.B)
+  val edge_itlb_pmiss  = RegInit(false.B)
+  val edge_itlb_smiss  = RegInit(false.B)
+  val edge_memory_order_xcpt = RegInit(false.B)
+  val edge_pc = Reg(UInt(coreMaxAddrBits.W))
+
+  val edge_event_miss = (edge_icache_miss || edge_itlb_pmiss || edge_itlb_smiss || edge_memory_order_xcpt) && in_mask(0) && in_uops(0).edge_inst && (in_uops(0).debug_pc === edge_pc)
+
+  when(edge_event_miss) {
+    in_uops(0).tea_psv.itlb_pmiss  := io.enq.bits.itlb_pmiss || edge_itlb_pmiss
+    in_uops(0).tea_psv.itlb_smiss  := io.enq.bits.itlb_smiss || edge_itlb_smiss
+    in_uops(0).tea_psv.icache_miss := io.enq.bits.icache_miss || edge_icache_miss
+    in_uops(0).tea_psv.memory_order_xcpt := io.enq.bits.memory_order_xcpt || edge_memory_order_xcpt
+  }
+
+  when (io.enq.valid && do_enq) {
+    edge_itlb_pmiss  := false.B
+    edge_itlb_smiss  := false.B
+    edge_icache_miss := false.B
+    edge_memory_order_xcpt := false.B
+    when(!io.enq.bits.mask.orR() && (io.enq.bits.icache_miss || io.enq.bits.itlb_pmiss || io.enq.bits.itlb_smiss || io.enq.bits.memory_order_xcpt)) {
+      edge_itlb_pmiss  := io.enq.bits.itlb_pmiss
+      edge_itlb_smiss  := io.enq.bits.itlb_smiss
+      edge_icache_miss := io.enq.bits.icache_miss
+      edge_memory_order_xcpt   := io.enq.bits.memory_order_xcpt
+      edge_pc := io.enq.bits.pc
+    }
+  }
+
+  if (DEBUG_PRINTF) {
+    def instrFromUOp(uop: MicroOp) = if (uop.is_rvc == true.B) uop.debug_inst(15, 0) else uop.debug_inst
+    def pcFromUOp(uop: MicroOp): UInt = uop.debug_pc(vaddrBits-1,0)
+    val debug_tsc_reg = RegInit(0.U(xLen.W))
+    debug_tsc_reg := debug_tsc_reg + 1.U
+    when(io.enq.valid && do_enq) {
+      for (b <- 0 until nBanks) {
+        for (w <- 0 until bankWidth) {
+          val i = (b * bankWidth) + w
+          when(io.enq.bits.mask(i)) {
+            printf("%d | [FETCHB] | enqueue     | 0x%x DASM(0x%x)\n", debug_tsc_reg, pcFromUOp(in_uops(i)), instrFromUOp(in_uops(i)));
+          }
+        }
+      }
     }
   }
 

@@ -411,6 +411,7 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
                                 flush_pc, flush_pc_next)
 
     }
+    io.ifu.redirect_memory_order_xcpt := RegNext(rob.io.flush.bits.memory_order_xcpt)
     io.ifu.redirect_ftq_idx := RegNext(rob.io.flush.bits.ftq_idx)
   } .elsewhen (brupdate.b2.mispredict && !RegNext(rob.io.flush.valid)) {
     val block_pc = AlignPCToBoundary(io.ifu.get_pc(1).pc, icBlockBytes)
@@ -709,9 +710,12 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   // LDQ/STQ Allocation Logic
 
   for (w <- 0 until coreWidth) {
+    val lsq_full = dis_valids(w) && !dis_uops(w).exception && ((dis_uops(w).uses_ldq && io.lsu.ldq_full(w)) || (dis_uops(w).uses_stq && io.lsu.stq_full(w)))
+
     // Dispatching instructions request load/store queue entries when they can proceed.
     dis_uops(w).ldq_idx := io.lsu.dis_ldq_idx(w)
     dis_uops(w).stq_idx := io.lsu.dis_stq_idx(w)
+    dis_uops(w).tea_psv.lsq_full := RegNext(lsq_full)
   }
 
   //-------------------------------------------------------------
@@ -1277,6 +1281,7 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
 
   // LSU <> ROB
   rob.io.lsu_clr_bsy    := io.lsu.clr_bsy
+  rob.io.lsu_clr_bsy_psv := io.lsu.clr_bsy_psv
   rob.io.lsu_clr_unsafe := io.lsu.clr_unsafe
   rob.io.lxcpt          <> io.lsu.lxcpt
 
@@ -1393,7 +1398,85 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   coreMonitorBundle.clock  := clock
   coreMonitorBundle.reset  := reset
 
+  if (io.traceDoctor.traceWidth >= 512) {
+    // TEA trace definition
+    assert(coreWidth <= 4, "this TraceDoctor setup only supports up to 4-wide cores")
 
+    val exception = rob.io.com_xcpt.valid
+    val committing = !exception && !rob.io.commit.blocked && rob.io.commit.arch_valids.reduce(_||_)
+    val dispatching = dis_fire.reduce(_||_)
+    val validHead = !exception && !rob.io.commit.blocked && rob.io.commit.instr_valids.reduce(_||_)
+    val csrStall = csr.io.csr_stall
+    val robPopulated = validHead && !RegNext(validHead)
+    val headMoved = rob.io.rob_head_idx =/= RegNext(rob.io.rob_head_idx)
+    val tailMoved = rob.io.rob_tail_idx =/= RegNext(rob.io.rob_tail_idx)
+
+    val trace_out = !csrStall && (committing || robPopulated || exception || dispatching || headMoved || tailMoved)
+
+    val tsc_cycle = debug_tsc_reg
+    val rob_state = Cat(Seq(exception, dispatching, robPopulated, committing))
+
+    val instr_flags = Cat((for (i <- 0 until coreWidth) yield {
+      Cat(Seq(
+        rob.io.commit.arch_valids(i),
+        rob.io.commit.instr_valids(i),
+        rob.io.commit.uops(i).tea_psv.icache_miss,
+        rob.io.commit.uops(i).tea_psv.itlb_smiss,
+        rob.io.commit.uops(i).tea_psv.itlb_pmiss,
+        rob.io.commit.uops(i).tea_psv.dcache_miss,
+        rob.io.commit.uops(i).tea_psv.dtlb_smiss,
+        rob.io.commit.uops(i).tea_psv.dtlb_pmiss,
+        rob.io.commit.uops(i).tea_psv.lsq_full,
+        rob.io.commit.uops(i).tea_psv.memory_order_xcpt,
+        rob.io.commit.uops(i).tea_psv.branch_miss,
+        rob.io.commit.uops(i).flush_on_commit,
+      ).reverse).pad(16)
+    }).reverse)
+    val instr_addresses = Cat((for (i <- 0 until coreWidth) yield {
+      rob.io.commit.uops(i).debug_pc(vaddrBits - 1, 0).pad(64)
+    }).reverse)
+
+    val instr_memory_latencies = Cat((for (i <- 0 until coreWidth) yield {
+      rob.io.commit.uops(i).memory_latency.getOrElse(0.U)(15, 0).pad(16)
+    }).reverse)
+
+    io.traceDoctor.valid := trace_out
+    io.traceDoctor.bits := Cat(Seq(
+      0.U.pad(64),
+      instr_memory_latencies.pad(64),
+      instr_addresses.pad(256),
+      instr_flags.pad(64),
+      Cat(Seq(
+        rob.io.rob_tail_idx.pad(8)(7, 0),
+        rob.io.rob_head_idx.pad(8)(7, 0),
+        rob_state.pad(4)(3, 0),
+        tsc_cycle.pad(44)(43, 0)
+      )).pad(64)
+    )).pad(io.traceDoctor.traceWidth).asBools
+
+
+    dontTouch(io.traceDoctor)
+  }
+  //-------------------------------------------------------------
+  if (DEBUG_PRINTF) {
+    val exception = rob.io.com_xcpt.valid
+    val committing = !exception && !rob.io.commit.blocked && rob.io.commit.arch_valids.reduce(_||_)
+    val validHead = !exception && !rob.io.commit.blocked && rob.io.commit.instr_valids.reduce(_||_)
+    val robPopulated = validHead && !RegNext(validHead)
+    def instrFromUOp(uop: MicroOp): UInt = Mux(uop.is_rvc === true.B, uop.debug_inst(15, 0), uop.debug_inst)
+    def pcFromUOp(uop: MicroOp): UInt = uop.debug_pc(vaddrBits-1,0)
+    when (committing || exception || robPopulated) {
+      printf("%d |   [CORE] | rob         | [%b%b%b]", debug_tsc_reg, committing, robPopulated, exception)
+      for (i <- 0 until coreWidth) {
+        printf(" | [%b%b] 0x%x DASM(0x%x)",
+          rob.io.commit.arch_valids(i),
+          rob.io.commit.instr_valids(i),
+          pcFromUOp(rob.io.commit.uops(i)),
+          instrFromUOp(rob.io.commit.uops(i)))
+      }
+      printf("\n")
+    }
+  }
   //-------------------------------------------------------------
   //-------------------------------------------------------------
   // Page Table Walker
@@ -1423,23 +1506,6 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
         !dis_uops(w).exception
       )
     }
-  }
-
-  if (io.traceDoctor.traceWidth >= (64 + 64 + (coreWidth * 64))) {
-    // This for example provides the same information as tracerV
-    val traceValids: Vec[Bool] = rob.io.commit.arch_valids
-    val traceTimestamp: UInt = debug_tsc_reg(63, 0)
-    val traceFlags: UInt = traceValids.reverse.asUInt()(coreWidth - 1, 0)
-    val traceAddresses: UInt = Cat((for (i <- 0 until coreWidth) yield {
-      rob.io.commit.uops(i).debug_pc(vaddrBits - 1, 0).pad(64)
-    }).reverse)
-
-    io.traceDoctor.valid := traceValids.reduce(_||_) && !csr.io.csr_stall
-    io.traceDoctor.bits := Cat(Seq(
-      traceTimestamp.pad(64),
-      traceFlags.pad(64),
-      traceAddresses
-    ).reverse).pad(io.traceDoctor.traceWidth).asBools
   }
 
   if (usingTrace) {

@@ -12,6 +12,7 @@ import freechips.rocketchip.config.{Parameters, Config, Field}
 import freechips.rocketchip.subsystem._
 import freechips.rocketchip.devices.tilelink.{BootROMParams}
 import freechips.rocketchip.diplomacy.{SynchronousCrossing, AsynchronousCrossing, RationalCrossing}
+import freechips.rocketchip.diplomacy.{LazyModule, ValName}
 import freechips.rocketchip.rocket._
 import freechips.rocketchip.tile._
 
@@ -32,6 +33,18 @@ class WithBoomCommitLogPrintf extends Config((site, here, up) => {
   }
 })
 
+class WithSoftwarePrefetchRoCC extends Config((site, here, up) => {
+  case BuildRoCC => Seq((p: Parameters) => {
+    implicit val valName = ValName("SoftwarePrefetchRoCC")
+    LazyModule(new SoftwarePrefetchRoCC(opcodes=new OpcodeSet(Seq("b00000011".U)), queueSize=16)(p))
+  })
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableSoftwarePrefetchRoCC = true
+    )))
+    case other => other
+  }
+})
 
 class WithBoomBranchPrintf extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
@@ -51,6 +64,23 @@ class WithNBoomPerfCounters(n: Int) extends Config((site, here, up) => {
   }
 })
 
+class WithBoomDebugPrintf extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableDebugPrintf = true
+    )))
+    case other => other
+  }
+})
+
+class WithBoomMemoryLatencyTracking extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableMemoryLatencyTracking = true
+    )))
+    case other => other
+  }
+})
 
 class WithSynchronousBoomTiles extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
@@ -219,6 +249,100 @@ class WithNLargeBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends 
   })
 )
 // DOC include end: LargeBoomConfig
+
+class WithNUltraBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends Config(
+  new WithTAGELBPD ++ // Default to TAGE-L BPD
+    new Config((site, here, up) => {
+      case TilesLocated(InSubsystem) => {
+        val prev = up(TilesLocated(InSubsystem), site)
+        val idOffset = overrideIdOffset.getOrElse(prev.size)
+        (0 until n).map { i =>
+          BoomTileAttachParams(
+            tileParams = BoomTileParams(
+              core = BoomCoreParams(
+                fetchWidth = 8,
+                decodeWidth = 4,
+                numRobEntries = 192, // + 50%
+                issueParams = Seq(
+                  IssueParams(issueWidth=2, numEntries=48, iqType=IQT_MEM.litValue, dispatchWidth=4),  // + 100%
+                  IssueParams(issueWidth=4, numEntries=80, iqType=IQT_INT.litValue, dispatchWidth=4),  // + 100%
+                  IssueParams(issueWidth=2, numEntries=48, iqType=IQT_FP.litValue , dispatchWidth=4)), // + 50%
+                numIntPhysRegisters = 192, // + 50%
+                numFpPhysRegisters = 192, // + 50%
+                numLdqEntries = 64, // + 100%
+                numStqEntries = 64, // + 100%
+                maxBrCount = 30, // + 50%
+                numFetchBufferEntries = 48, // + 50%
+                enablePrefetching = true,
+                ftq = FtqParameters(nEntries=60), // + 50%
+                fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true)),
+                numDCacheBanks = 1,
+                numRXQEntries = 16, // Number of RoCC instruction waiting for execute
+                numRCQEntries = 16, // Number of RoCC instructions waiting for commit/unbusy
+              ),
+              dcache = Some(
+                DCacheParams(rowBits = site(SystemBusKey).beatBits, nSets=64, nWays=8, nMSHRs=16, nTLBWays=32, nSDQ = 64, nRPQ = 16)
+              ),
+              icache = Some(
+                ICacheParams(rowBits = site(SystemBusKey).beatBits, nSets=64, nWays=8, fetchBytes=4*4)
+              ),
+              hartId = i + idOffset
+            ),
+            crossingParams = RocketCrossingParams()
+          )
+        } ++ prev
+      }
+      case SystemBusKey => up(SystemBusKey, site).copy(beatBytes = 16)
+      case XLen => 64
+    })
+)
+
+class WithNTestBooms(n: Int = 1, overrideIdOffset: Option[Int] = None) extends Config(
+  new WithTAGELBPD ++ // Default to TAGE-L BPD
+    new Config((site, here, up) => {
+      case TilesLocated(InSubsystem) => {
+        val prev = up(TilesLocated(InSubsystem), site)
+        val idOffset = overrideIdOffset.getOrElse(prev.size)
+        (0 until n).map { i =>
+          BoomTileAttachParams(
+            tileParams = BoomTileParams(
+              core = BoomCoreParams(
+                fetchWidth = 8,
+                decodeWidth = 4,
+                numRobEntries = 192, // + 50%
+                issueParams = Seq(
+                  IssueParams(issueWidth=2, numEntries=48, iqType=IQT_MEM.litValue, dispatchWidth=4),  // + 100%
+                  IssueParams(issueWidth=4, numEntries=80, iqType=IQT_INT.litValue, dispatchWidth=4),  // + 100%
+                  IssueParams(issueWidth=2, numEntries=48, iqType=IQT_FP.litValue , dispatchWidth=4)), // + 50%
+                numIntPhysRegisters = 192, // + 50%
+                numFpPhysRegisters = 192, // + 50%
+                numLdqEntries = 64, // + 100%
+                numStqEntries = 64, // + 100%
+                maxBrCount = 30, // + 50%
+                numFetchBufferEntries = 48, // + 50%
+                enablePrefetching = true,
+                ftq = FtqParameters(nEntries=60), // + 50%
+                fpu = Some(freechips.rocketchip.tile.FPUParams(sfmaLatency=4, dfmaLatency=4, divSqrt=true)),
+                numDCacheBanks = 1,
+                numRXQEntries = 16, // Number of RoCC instruction waiting for execute
+                numRCQEntries = 16, // Number of RoCC instructions waiting for commit/unbusy
+              ),
+              dcache = Some(
+                DCacheParams(rowBits = site(SystemBusKey).beatBits, nSets=64, nWays=8, nMSHRs=16, nTLBWays=32, nSDQ = 64, nRPQ = 64)
+              ),
+              icache = Some(
+                ICacheParams(rowBits = site(SystemBusKey).beatBits, nSets=64, nWays=8, fetchBytes=4*4)
+              ),
+              hartId = i + idOffset
+            ),
+            crossingParams = RocketCrossingParams()
+          )
+        } ++ prev
+      }
+      case SystemBusKey => up(SystemBusKey, site).copy(beatBytes = 16)
+      case XLen => 64
+    })
+)
 
 /**
  * 4-wide BOOM.

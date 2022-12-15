@@ -102,6 +102,9 @@ case class BoomCoreParams(
   enableBranchPrintf: Boolean = false,
   enableMemtracePrintf: Boolean = false,
 
+  enableDebugPrintf: Boolean = false,
+  enableSoftwarePrefetchRoCC: Boolean = false,
+  enableMemoryLatencyTracking: Boolean = false,
 // DOC include end: BOOM Parameters
   setTraceDoctorWidth: Int = 0
 ) extends freechips.rocketchip.tile.CoreParams
@@ -281,6 +284,7 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val BRANCH_PRINTF       = boomParams.enableBranchPrintf // dump branch predictor results
   val MEMTRACE_PRINTF     = boomParams.enableMemtracePrintf // dump trace of memory accesses to L1D for debugging
 
+  val DEBUG_PRINTF        = boomParams.enableDebugPrintf
   //************************************
   // Other Non/Should-not-be sythesizable modules
   val useFetchMonitor = boomParams.useFetchMonitor

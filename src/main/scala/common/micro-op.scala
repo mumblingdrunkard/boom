@@ -17,6 +17,7 @@ import chisel3.util._
 import freechips.rocketchip.config.Parameters
 
 import boom.exu.FUConstants
+import freechips.rocketchip.util.UIntIsOneOf
 
 /**
  * Extension to BoomBundle to add a MicroOp
@@ -135,7 +136,15 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   val bp_debug_if      = Bool()             // Breakpoint
   val bp_xcpt_if       = Bool()             // Breakpoint
 
+  val memory_latency = boomParams.enableMemoryLatencyTracking match {
+    case true => Some(UInt(xLen.W))
+    case _ => None
+  }
 
+  val tea_psv = new PerformanceSignatureVector
+
+  //Is this microOp a prefetch
+  def is_prefetch      = mem_cmd.isOneOf(M_PFR, M_PFW)
   // What prediction structure provides the prediction FROM this op
   val debug_fsrc       = UInt(BSRC_SZ.W)
   // What prediction structure provides the prediction TO this op
@@ -171,6 +180,22 @@ class CtrlSignals extends Bundle()
   val is_load     = Bool()   // will invoke TLB address lookup
   val is_sta      = Bool()   // will invoke TLB address lookup
   val is_std      = Bool()
+}
+
+class PerformanceSignatureVector extends Bundle() {
+  val icache_miss         = Bool()
+  val itlb_pmiss          = Bool()
+  val itlb_smiss          = Bool()
+  val lsq_full            = Bool()
+
+  val dcache_miss         = Bool()
+  val dtlb_pmiss          = Bool()
+  val dtlb_smiss          = Bool()
+
+  val branch_miss         = Bool()
+  val memory_order_xcpt   = Bool()
+  // val exception           = Bool() // Already contained in MicroOp
+  // val flushed             = Bool() // Already contained in MicroOp
 }
 
 
