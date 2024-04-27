@@ -34,6 +34,9 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   with freechips.rocketchip.rocket.constants.MemoryOpConstants
   with freechips.rocketchip.rocket.constants.ScalarOpConstants
 {
+  // NOTE RFP: set for doppelganger requests to the dcache
+  val is_rfp           = Bool()
+
   val uopc             = UInt(UOPC_SZ.W)       // micro-op code
   val inst             = UInt(32.W)
   val debug_inst       = UInt(32.W)
@@ -157,6 +160,7 @@ class MicroOp(implicit p: Parameters) extends BoomBundle
   // Does this register write-back
   def rf_wen           = dst_rtype =/= RT_X
 
+  // NOTE RFP: Are loads unsafe because of load store ordering speculation?
   // Is it possible for this uop to misspeculate, preventing the commit of subsequent uops?
   def unsafe           = uses_ldq || (uses_stq && !is_fence) || is_br || is_jalr
 

@@ -11,7 +11,6 @@ import boom.common._
 import boom.exu.{CommitExceptionSignals}
 import boom.util.{BoomCoreStringPrefix}
 
-
 class SwBranchPredictorBank(implicit p: Parameters) extends BranchPredictorBank()(p)
 {
   val mems = Nil

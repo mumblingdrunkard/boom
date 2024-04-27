@@ -58,8 +58,6 @@ class BoomWritebackUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1Hella
   io.resp            := false.B
   io.lsu_release.valid := false.B
 
-
-
   val r_address = Cat(req.tag, req.idx) << blockOffBits
   val id = cfg.nMSHRs
   val probeResponse = edge.ProbeAck(
@@ -183,7 +181,7 @@ class BoomProbeUnit(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCach
   io.rep.bits := edge.ProbeAck(req, report_param)
 
   assert(!io.rep.valid || !edge.hasData(io.rep.bits),
-    "ProbeUnit should not send ProbeAcks with data, WritebackUnit should handle it")
+    "[dcache probe] ProbeUnit should not send ProbeAcks with data, WritebackUnit should handle it")
 
   io.meta_read.valid := state === s_meta_read
   io.meta_read.bits.idx := req_idx
@@ -547,7 +545,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   dataReadArb.io.in(1).bits.req(0)  := wb.io.data_req.bits
   dataReadArb.io.in(1).bits.valid   := widthMap(w => (w == 0).B)
   wb.io.data_req.ready  := metaReadArb.io.in(2).ready && dataReadArb.io.in(1).ready
-  assert(!(wb.io.meta_read.fire ^ wb.io.data_req.fire))
+  assert(!(wb.io.meta_read.fire ^ wb.io.data_req.fire), "[dcache] meta_read.fire not ")
 
   // -------
   // Prober
@@ -582,6 +580,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   val s0_valid = Mux(io.lsu.req.fire, VecInit(io.lsu.req.bits.map(_.valid)),
                  Mux(mshrs.io.replay.fire || wb_fire || prober_fire || prefetch_fire || mshrs.io.meta_read.fire,
                                         VecInit(1.U(memWidth.W).asBools), VecInit(0.U(memWidth.W).asBools)))
+
   val s0_req   = Mux(io.lsu.req.fire        , VecInit(io.lsu.req.bits.map(_.bits)),
                  Mux(wb_fire                  , wb_req,
                  Mux(prober_fire              , prober_req,
@@ -895,7 +894,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
                             !(io.lsu.exception && s2_req(w).uop.uses_ldq) &&
                             !IsKilledByBranch(io.lsu.brupdate, s2_req(w).uop)
     io.lsu.nack(w).bits  := UpdateBrMask(io.lsu.brupdate, s2_req(w))
-    assert(!(io.lsu.nack(w).valid && s2_type =/= t_lsu))
+    assert(!(io.lsu.nack(w).valid && s2_type =/= t_lsu), "[dcache] nack and stuff")
   }
 
   // Store/amo hits
@@ -905,7 +904,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
   for (w <- 1 until memWidth) {
     assert(!(s2_valid(w) && s2_hit(w) && isWrite(s2_req(w).uop.mem_cmd) &&
                          !s2_sc_fail && !(s2_send_nack(w) && s2_nack(w))),
-      "Store must go through 0th pipe in L1D")
+      "[dcache] Store must go through 0th pipe in L1D")
   }
 
   // For bypassing

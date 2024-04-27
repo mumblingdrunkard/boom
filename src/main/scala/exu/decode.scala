@@ -479,6 +479,8 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
   val uop = Wire(new MicroOp())
   uop := io.enq.uop
 
+  dontTouch(uop.debug_pc)
+
   var decode_table = XDecode.table
   if (usingFPU) decode_table ++= FDecode.table
   if (usingFPU && usingFDivSqrt) decode_table ++= FDivSqrtDecode.table
@@ -524,6 +526,8 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
   uop.exc_cause := xcpt_cause
 
   //-------------------------------------------------------------
+
+  uop.is_rfp     := DontCare
 
   uop.uopc       := cs.uopc
   uop.iq_type    := cs.iq_type

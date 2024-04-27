@@ -129,6 +129,8 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
 
   val fp_stdata   = Flipped(Decoupled(new ExeUnitResp(fLen)))
 
+  val rfp = Flipped(new RfpLSUIO)
+
   val commit      = Input(new CommitSignals)
   val commit_load_at_rob_head = Input(Bool())
 
@@ -194,6 +196,18 @@ class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
   val forward_stq_idx     = UInt(stqAddrSz.W) // Which store did we get the store-load forward from?
 
   val debug_wb_data       = UInt(xLen.W)
+
+  // === RFP fields ===
+  // A separate field for the predicted address (This should be shared with addr in a real implementation)
+  val debug_pred_addr     = Valid(UInt(coreMaxAddrBits.W))
+  // The uop that triggered this prediction
+  val debug_pred_uop      = Valid(new MicroOp())
+  // Whether the address in this entry is for a prefetch
+  val pred_val            = Valid(UInt(xLen.W))
+  val rfp_fired           = Bool()
+  val rfp_correct         = Bool()
+  val rfp_resp_sent       = Bool()
+  val rfp_was_forwarded   = Bool()
 }
 
 class STQEntry(implicit p: Parameters) extends BoomBundle()(p)
@@ -217,8 +231,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   val ldq = Reg(Vec(numLdqEntries, Valid(new LDQEntry)))
   val stq = Reg(Vec(numStqEntries, Valid(new STQEntry)))
-
-
+  // dontTouch(ldq)
 
   val ldq_head         = Reg(UInt(ldqAddrSz.W))
   val ldq_tail         = Reg(UInt(ldqAddrSz.W))
@@ -226,7 +239,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq_tail         = Reg(UInt(stqAddrSz.W))
   val stq_commit_head  = Reg(UInt(stqAddrSz.W)) // point to next store to commit
   val stq_execute_head = Reg(UInt(stqAddrSz.W)) // point to next store to execute
-
 
   // If we got a mispredict, the tail will be misaligned for 1 extra cycle
   assert (io.core.brupdate.b2.mispredict ||
@@ -313,10 +325,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     val dis_st_val = io.core.dis_uops(w).valid && io.core.dis_uops(w).bits.uses_stq && !io.core.dis_uops(w).bits.exception
     when (dis_ld_val)
     {
-      ldq(ld_enq_idx).valid                := true.B
-      ldq(ld_enq_idx).bits.uop             := io.core.dis_uops(w).bits
-      ldq(ld_enq_idx).bits.youngest_stq_idx  := st_enq_idx
-      ldq(ld_enq_idx).bits.st_dep_mask     := next_live_store_mask
+      ldq(ld_enq_idx).valid                 := true.B
+      ldq(ld_enq_idx).bits.uop              := io.core.dis_uops(w).bits
+      ldq(ld_enq_idx).bits.youngest_stq_idx := st_enq_idx
+      ldq(ld_enq_idx).bits.st_dep_mask      := next_live_store_mask
 
       ldq(ld_enq_idx).bits.addr.valid      := false.B
       ldq(ld_enq_idx).bits.executed        := false.B
@@ -324,6 +336,20 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(ld_enq_idx).bits.order_fail      := false.B
       ldq(ld_enq_idx).bits.observed        := false.B
       ldq(ld_enq_idx).bits.forward_std_val := false.B
+
+      ldq(ld_enq_idx).bits.pred_val.valid        := false.B
+      ldq(ld_enq_idx).bits.pred_val.bits         := DontCare
+      ldq(ld_enq_idx).bits.rfp_fired             := false.B
+      ldq(ld_enq_idx).bits.rfp_correct           := false.B
+      ldq(ld_enq_idx).bits.rfp_resp_sent         := false.B
+      ldq(ld_enq_idx).bits.rfp_was_forwarded     := false.B
+      ldq(ld_enq_idx).bits.debug_pred_addr.valid := io.core.rfp.predictions(w).valid
+      ldq(ld_enq_idx).bits.debug_pred_addr.bits  := io.core.rfp.predictions(w).bits.addr
+      ldq(ld_enq_idx).bits.debug_pred_uop        := io.core.rfp.debug_uops(w)
+
+      when (io.core.rfp.predictions(w).valid) {
+        assert(io.core.dis_uops(w).bits.debug_pc === io.core.rfp.debug_uops(w).bits.debug_pc, "Writing prediction for wrong uOP")
+      }
 
       assert (ld_enq_idx === io.core.dis_uops(w).bits.ldq_idx, "[lsu] mismatch enq load tag.")
       assert (!ldq(ld_enq_idx).valid, "[lsu] Enqueuing uop is overwriting ldq entries")
@@ -355,8 +381,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   ldq_tail := ld_enq_idx
   stq_tail := st_enq_idx
 
-  io.dmem.force_order   := io.core.fence_dmem
-  io.core.fencei_rdy    := !stq_nonempty && io.dmem.ordered
+  io.dmem.force_order := io.core.fence_dmem
+  io.core.fencei_rdy  := !stq_nonempty && io.dmem.ordered
 
 
   //-------------------------------------------------------------
@@ -391,6 +417,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val will_fire_sta_retry      = Wire(Vec(memWidth, Bool()))
   val will_fire_store_commit   = Wire(Vec(memWidth, Bool()))
   val will_fire_load_wakeup    = Wire(Vec(memWidth, Bool()))
+  val will_fire_rfp            = Wire(Vec(memWidth, Bool()))
 
   val exe_req = WireInit(VecInit(io.core.exe.map(_.req)))
   // Sfence goes through all pipes
@@ -445,17 +472,68 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   }), ldq_head))
   val ldq_wakeup_e   = ldq(ldq_wakeup_idx)
 
+  // Prediction stuff
+  val correct_rfp_incoming = WireInit(VecInit((0 until memWidth).map(x => false.B)))
+  dontTouch(correct_rfp_incoming)
+  val incorrect_rfp_incoming = WireInit(VecInit((0 until memWidth).map(x => false.B)))
+  dontTouch(incorrect_rfp_incoming)
+
+  val rfp_uop = io.core.dis_uops(io.core.rfp.prediction.bits.lane).bits
+  val ldq_rfp_idx = rfp_uop.ldq_idx
+  val ldq_rfp_e = ldq(ldq_rfp_idx)
+
+  val rfp_correct = VecInit((0 until numLdqEntries).map(ldq_idx => true.B
+    && ldq(ldq_idx).valid 
+    && ( ldq(ldq_idx).bits.rfp_correct 
+         || (0 until memWidth).map(w => correct_rfp_incoming(w) && exe_req(w).bits.uop.ldq_idx === ldq_idx.U).reduce(_||_)
+       )
+  ))
+  dontTouch(rfp_correct)
+
+  // Register file prefetches where the prediction is correct, the data is written to the ldq, and we haven't sent a response
+  val rfp_unsent = VecInit((0 until numLdqEntries).map(ldq_idx => true.B
+    && ldq(ldq_idx).valid
+    && ldq(ldq_idx).bits.rfp_correct
+    && ldq(ldq_idx).bits.pred_val.valid
+    && ( ldq(ldq_idx).bits.rfp_resp_sent === false.B ) 
+  ))
+  dontTouch(rfp_correct)
+
+  var rfp_consider = WireInit(VecInit((0 until numLdqEntries).map(x => true.B)))
+  def ldq_next_sendable_rfp_idx(take: Bool): (UInt, Bool) = {
+    val ldq_idx = PriorityEncoder(rfp_unsent.asUInt() & rfp_consider.asUInt())
+    val valid = ((rfp_unsent.asUInt() & rfp_consider.asUInt()) =/= 0.U) && take
+    val new_rfp_consider = WireInit(rfp_consider)
+    new_rfp_consider(ldq_idx) := false.B
+    rfp_consider = Mux(take, new_rfp_consider, rfp_consider)
+    (ldq_idx, valid)
+  }
+
   // -----------------------
   // Determine what can fire
 
   // Can we fire a incoming load
-  val can_fire_load_incoming = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_load)
+  // NOTE RFP: We will not fire loads to the dcache for correctly predicted loads
+  val can_fire_load_incoming = widthMap(w => true.B
+    && exe_req(w).valid 
+    && exe_req(w).bits.uop.ctrl.is_load
+    // && !correct_rfp_incoming(w) // Don't fire when the prediction is correct
+  )
 
   // Can we fire an incoming store addrgen + store datagen
   val can_fire_stad_incoming = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_sta
                                                               && exe_req(w).bits.uop.ctrl.is_std)
 
-  // Can we fire an incoming store addrgen
+  // NOTE RFP: Restricted to firing RFP load on mem port 0
+  val can_fire_rfp = widthMap(w => 
+    io.core.rfp.prediction.valid                             && 
+    (w == 0).B                                               && 
+    io.core.dis_uops(io.core.rfp.prediction.bits.lane).valid &&
+    !io.core.dis_uops(io.core.rfp.prediction.bits.lane).bits.exception  
+  )
+  dontTouch(can_fire_rfp)
+
+ // Can we fire an incoming store addrgen
   val can_fire_sta_incoming  = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_sta
                                                               && !exe_req(w).bits.uop.ctrl.is_std)
 
@@ -561,7 +639,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // Notes on performance
     //  - Prioritize releases, this speeds up cache line writebacks and refills
     //  - Store commits are lowest priority, since they don't "block" younger instructions unless stq fills up
+    // NOTE RFP: Arbitration
     will_fire_load_incoming (w) := lsu_sched(can_fire_load_incoming (w) , true , true , true , false) // TLB , DC , LCAM
+    // NOTE RFP: Maybe predicted load here?
     will_fire_stad_incoming (w) := lsu_sched(can_fire_stad_incoming (w) , true , false, true , true)  // TLB ,    , LCAM , ROB
     will_fire_sta_incoming  (w) := lsu_sched(can_fire_sta_incoming  (w) , true , false, true , true)  // TLB ,    , LCAM , ROB
     will_fire_std_incoming  (w) := lsu_sched(can_fire_std_incoming  (w) , false, false, false, true)  //                 , ROB
@@ -570,19 +650,30 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     will_fire_hella_incoming(w) := lsu_sched(can_fire_hella_incoming(w) , true , true , false, false) // TLB , DC
     will_fire_hella_wakeup  (w) := lsu_sched(can_fire_hella_wakeup  (w) , false, true , false, false) //     , DC
     will_fire_load_retry    (w) := lsu_sched(can_fire_load_retry    (w) , true , true , true , false) // TLB , DC , LCAM
+    will_fire_rfp           (w) := lsu_sched(can_fire_rfp           (w) , false, true , true , false) //     , DC , LCAM
     will_fire_sta_retry     (w) := lsu_sched(can_fire_sta_retry     (w) , true , false, true , true)  // TLB ,    , LCAM , ROB // TODO: This should be higher priority
     will_fire_load_wakeup   (w) := lsu_sched(can_fire_load_wakeup   (w) , false, true , true , false) //     , DC , LCAM1
     will_fire_store_commit  (w) := lsu_sched(can_fire_store_commit  (w) , false, true , false, false) //     , DC
 
-
-    assert(!(exe_req(w).valid && !(will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w) || will_fire_std_incoming(w) || will_fire_sfence(w))))
+    // This verifies that we're not backpressuring the maddrgen
+    assert(!(
+      exe_req(w).valid 
+      && !( will_fire_load_incoming(w) 
+         || correct_rfp_incoming(w)    // If we're not firing a load, it must be because we correctly predicted it
+         || will_fire_stad_incoming(w) 
+         || will_fire_sta_incoming(w) 
+         || will_fire_std_incoming(w) 
+         || will_fire_sfence(w)
+        )
+      ), "[lsu] maddrgen backpressure detected"
+    )
 
     when (will_fire_load_wakeup(w)) {
-      block_load_mask(ldq_wakeup_idx)           := true.B
+      block_load_mask(ldq_wakeup_idx) := true.B
     } .elsewhen (will_fire_load_incoming(w)) {
       block_load_mask(exe_req(w).bits.uop.ldq_idx) := true.B
     } .elsewhen (will_fire_load_retry(w)) {
-      block_load_mask(ldq_retry_idx)            := true.B
+      block_load_mask(ldq_retry_idx) := true.B
     }
     exe_tlb_valid(w) := !tlb_avail
   }
@@ -640,6 +731,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                        will_fire_sta_retry     (w)  , exe_tlb_uop(w).mem_size,
                    Mux(will_fire_hella_incoming(w)  , hella_req.size,
                                                       0.U)))
+
   val exe_cmd    = widthMap(w =>
                    Mux(will_fire_load_incoming (w) ||
                        will_fire_stad_incoming (w) ||
@@ -661,6 +753,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     dtlb.io.req(w).bits.vaddr       := exe_tlb_vaddr(w)
     dtlb.io.req(w).bits.size        := exe_size(w)
     dtlb.io.req(w).bits.cmd         := exe_cmd(w)
+    // Set for bare-metal mode
     dtlb.io.req(w).bits.passthrough := exe_passthr(w)
     dtlb.io.req(w).bits.v           := io.ptw.status.v
     dtlb.io.req(w).bits.prv         := io.ptw.status.prv
@@ -692,11 +785,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val mem_xcpt_vaddrs = RegNext(exe_tlb_vaddr)
 
   for (w <- 0 until memWidth) {
-    assert (!(dtlb.io.req(w).valid && exe_tlb_uop(w).is_fence), "Fence is pretending to talk to the TLB")
+    assert (!(dtlb.io.req(w).valid && exe_tlb_uop(w).is_fence), "[lsu] Fence is pretending to talk to the TLB")
     assert (!((will_fire_load_incoming(w) || will_fire_sta_incoming(w) || will_fire_stad_incoming(w)) &&
       exe_req(w).bits.mxcpt.valid && dtlb.io.req(w).valid &&
     !(exe_tlb_uop(w).ctrl.is_load || exe_tlb_uop(w).ctrl.is_sta)),
-      "A uop that's not a load or store-address is throwing a memory exception.")
+      "[lsu] A uop that's not a load or store-address is throwing a memory exception.")
   }
 
   mem_xcpt_valid := mem_xcpt_valids.reduce(_||_)
@@ -749,9 +842,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     when (mem_xcpt_valids(w))
     {
       assert(RegNext(will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w) ||
-        will_fire_load_retry(w) || will_fire_sta_retry(w)))
+        will_fire_load_retry(w) || will_fire_sta_retry(w)), "[lsu] Excepting operation is not one of the operations issued in the previous cycle")
       // Technically only faulting AMOs need this
-      assert(mem_xcpt_uops(w).uses_ldq ^ mem_xcpt_uops(w).uses_stq)
+      assert(mem_xcpt_uops(w).uses_ldq ^ mem_xcpt_uops(w).uses_stq, "[lsu] Excepting operation uses both ldq and stq??? Don't know what that has to do with AMOs right now")
       when (mem_xcpt_uops(w).uses_ldq)
       {
         ldq(mem_xcpt_uops(w).ldq_idx).bits.uop.exception := true.B
@@ -763,7 +856,20 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     }
   }
 
+  //------------------------------
+  correct_rfp_incoming := widthMap(w => true.B
+    && ldq_incoming_e(w).valid // probably not needed
+    && ldq_incoming_e(w).bits.debug_pred_addr.valid                       // predicted address is valid
+    && (ldq_incoming_e(w).bits.debug_pred_addr.bits === exe_tlb_paddr(w)) // generated address matches the predicted address
+    && ldq_incoming_e(w).bits.rfp_fired
+  )
 
+  incorrect_rfp_incoming := widthMap(w => true.B
+    && ldq_incoming_e(w).valid // probably not needed
+    && ldq_incoming_e(w).bits.debug_pred_addr.valid                       // predicted address is valid
+    && (ldq_incoming_e(w).bits.debug_pred_addr.bits =/= exe_tlb_paddr(w)) // generated address does not match the predicted address
+    && ldq_incoming_e(w).bits.rfp_fired
+  )
 
   //------------------------------
   // Issue Someting to Memory
@@ -786,7 +892,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   val s0_executing_loads = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B)))
 
-
   for (w <- 0 until memWidth) {
     dmem_req(w).valid := false.B
     dmem_req(w).bits.uop   := NullMicroOp
@@ -798,19 +903,23 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     io.dmem.s1_kill(w) := false.B
 
     when (will_fire_load_incoming(w)) {
-      dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
+      dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w) && !correct_rfp_incoming(w)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop(w)
-
       s0_executing_loads(ldq_incoming_idx(w)) := dmem_req_fire(w)
-      assert(!ldq_incoming_e(w).bits.executed)
+      assert( false.B
+        || !ldq_incoming_e(w).bits.executed 
+        || incorrect_rfp_incoming(w) 
+        || correct_rfp_incoming(w)
+        , 
+        "[lsu] Firing load that has already executed without incorrect prediction"
+      )
     } .elsewhen (will_fire_load_retry(w)) {
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop(w)
-
       s0_executing_loads(ldq_retry_idx) := dmem_req_fire(w)
-      assert(!ldq_retry_e.bits.executed)
+      assert(!ldq_retry_e.bits.executed, "[lsu] Retrying load that's already executed")
     } .elsewhen (will_fire_store_commit(w)) {
       dmem_req(w).valid         := true.B
       dmem_req(w).bits.addr     := stq_commit_e.bits.addr.bits
@@ -832,7 +941,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
       s0_executing_loads(ldq_wakeup_idx) := dmem_req_fire(w)
 
-      assert(!ldq_wakeup_e.bits.executed && !ldq_wakeup_e.bits.addr_is_virtual)
+      assert(!ldq_wakeup_e.bits.executed && !ldq_wakeup_e.bits.addr_is_virtual, "[lsu] Waking up load that is already executed or has virtual address")
     } .elsewhen (will_fire_hella_incoming(w)) {
       assert(hella_state === h_s1)
 
@@ -865,6 +974,17 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).bits.is_hella       := true.B
       dmem_req(w).bits.is_hella_prft  := isPrefetch(hella_req.cmd)
     }
+      .elsewhen (will_fire_rfp(w))
+    {
+      assert(io.core.rfp.prediction.valid, "[lsu] Will fire predicted load without valid incoming prediction")
+      val lane = io.core.rfp.prediction.bits.lane
+      val uop = WireInit(io.core.dis_uops(lane).bits)
+      uop.is_rfp := true.B
+      dmem_req(w).valid := true.B
+      dmem_req(w).bits.addr := io.core.rfp.prediction.bits.addr
+      dmem_req(w).bits.uop := uop
+      s0_executing_loads(uop.ldq_idx) := dmem_req_fire(w)
+    }
 
     dmem_req(w).bits.uop.memory_latency.foreach(_ := io.core.tsc_reg)
 
@@ -883,7 +1003,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
     //-------------------------------------------------------------
     // Write Addr into the LAQ/SAQ
-    when (will_fire_load_incoming(w) || will_fire_load_retry(w))
+    when (will_fire_load_incoming(w) || correct_rfp_incoming(w) || will_fire_load_retry(w))
     {
       val ldq_idx = Mux(will_fire_load_incoming(w), ldq_incoming_idx(w), ldq_retry_idx)
       ldq(ldq_idx).bits.addr.valid          := true.B
@@ -901,6 +1021,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       } .elsewhen(exe_tlb_secondary_miss(w) && !ldq(ldq_idx).bits.uop.tea_psv.dtlb_pmiss) {
         ldq(ldq_idx).bits.uop.tea_psv.dtlb_smiss := true.B
       }
+    }
+
+    when (will_fire_rfp(w)) {
+      ldq(ldq_rfp_idx).bits.rfp_fired := true.B
     }
 
     when (will_fire_sta_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_retry(w))
@@ -945,6 +1069,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val will_fire_stdf_incoming = io.core.fp_stdata.fire
   require (xLen >= fLen) // for correct SDQ size
 
+  // -----------------
+  for (w <- 0 until memWidth) {
+    when (correct_rfp_incoming(w)) {
+      val ldq_idx = exe_req(w).bits.uop.ldq_idx
+      ldq(ldq_idx).bits.rfp_correct := true.B
+    }
+  }
+
   //-------------------------------------------------------------
   //-------------------------------------------------------------
   // Cache Access Cycle (Mem)
@@ -955,13 +1087,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val exe_req_killed = widthMap(w => IsKilledByBranch(io.core.brupdate, exe_req(w).bits.uop))
   val stdf_killed = IsKilledByBranch(io.core.brupdate, io.core.fp_stdata.bits.uop)
 
-  val fired_load_incoming  = widthMap(w => RegNext(will_fire_load_incoming(w) && !exe_req_killed(w)))
+
+  val fired_load_incoming  = widthMap(w => RegNext(will_fire_load_incoming(w) && !correct_rfp_incoming(w) && !exe_req_killed(w)))
   val fired_stad_incoming  = widthMap(w => RegNext(will_fire_stad_incoming(w) && !exe_req_killed(w)))
   val fired_sta_incoming   = widthMap(w => RegNext(will_fire_sta_incoming (w) && !exe_req_killed(w)))
   val fired_std_incoming   = widthMap(w => RegNext(will_fire_std_incoming (w) && !exe_req_killed(w)))
   val fired_stdf_incoming  = RegNext(will_fire_stdf_incoming && !stdf_killed)
   val fired_sfence         = RegNext(will_fire_sfence)
   val fired_release        = RegNext(will_fire_release)
+  val fired_rfp            = widthMap(w => RegNext(will_fire_rfp          (w) && !IsKilledByBranch(io.core.brupdate, rfp_uop)))
   val fired_load_retry     = widthMap(w => RegNext(will_fire_load_retry   (w) && !IsKilledByBranch(io.core.brupdate, ldq_retry_e.bits.uop)))
   val fired_sta_retry      = widthMap(w => RegNext(will_fire_sta_retry    (w) && !IsKilledByBranch(io.core.brupdate, stq_retry_e.bits.uop)))
   val fired_store_commit   = RegNext(will_fire_store_commit)
@@ -975,10 +1109,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val mem_ldq_wakeup_e     = RegNext(UpdateBrMask(io.core.brupdate, ldq_wakeup_e))
   val mem_ldq_retry_e      = RegNext(UpdateBrMask(io.core.brupdate, ldq_retry_e))
   val mem_stq_retry_e      = RegNext(UpdateBrMask(io.core.brupdate, stq_retry_e))
+  val mem_ldq_rfp_e        = RegNext(UpdateBrMask(io.core.brupdate, ldq_rfp_e))
   val mem_ldq_e            = widthMap(w =>
                              Mux(fired_load_incoming(w), mem_ldq_incoming_e(w),
                              Mux(fired_load_retry   (w), mem_ldq_retry_e,
-                             Mux(fired_load_wakeup  (w), mem_ldq_wakeup_e, (0.U).asTypeOf(Valid(new LDQEntry))))))
+                             Mux(fired_rfp          (w), mem_ldq_rfp_e,
+                             Mux(fired_load_wakeup  (w), mem_ldq_wakeup_e, (0.U).asTypeOf(Valid(new LDQEntry)))))))
   val mem_stq_e            = widthMap(w =>
                              Mux(fired_stad_incoming(w) ||
                                  fired_sta_incoming (w), mem_stq_incoming_e(w),
@@ -1105,8 +1241,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // We translated a store last cycle
   val do_st_search = widthMap(w => (fired_stad_incoming(w) || fired_sta_incoming(w) || fired_sta_retry(w)) && !mem_tlb_miss(w))
   // We translated a load last cycle
-  val do_ld_search = widthMap(w => ((fired_load_incoming(w) || fired_load_retry(w)) && !mem_tlb_miss(w)) ||
-                     fired_load_wakeup(w))
+  val do_ld_search = widthMap(w => 
+    ((fired_load_incoming(w) || fired_load_retry(w)) && !mem_tlb_miss(w)) ||
+    fired_load_wakeup(w) || 
+    fired_rfp(w)
+  )
   // We are making a local line visible to other harts
   val do_release_search = widthMap(w => fired_release(w))
 
@@ -1126,15 +1265,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val lcam_is_release = widthMap(w => fired_release(w))
   val lcam_ldq_idx  = widthMap(w =>
                       Mux(fired_load_incoming(w), mem_incoming_uop(w).ldq_idx,
+                      Mux(fired_rfp          (w), RegNext(ldq_rfp_idx),
                       Mux(fired_load_wakeup  (w), RegNext(ldq_wakeup_idx),
-                      Mux(fired_load_retry   (w), RegNext(ldq_retry_idx), 0.U))))
+                      Mux(fired_load_retry   (w), RegNext(ldq_retry_idx), 0.U)))))
   val lcam_stq_idx  = widthMap(w =>
                       Mux(fired_stad_incoming(w) ||
                           fired_sta_incoming (w), mem_incoming_uop(w).stq_idx,
                       Mux(fired_sta_retry    (w), RegNext(stq_retry_idx), 0.U)))
 
   val can_forward = WireInit(widthMap(w =>
-    Mux(fired_load_incoming(w) || fired_load_retry(w), !mem_tlb_uncacheable(w),
+    Mux(fired_load_incoming(w) || fired_load_retry(w) || fired_rfp(w), !mem_tlb_uncacheable(w),
       !ldq(lcam_ldq_idx(w)).bits.addr_is_uncacheable)))
 
   // Mask of stores which we conflict on address with
@@ -1142,21 +1282,23 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Mask of stores which we can forward from
   val ldst_forward_matches = WireInit(widthMap(w => VecInit((0 until numStqEntries).map(x=>false.B))))
 
-  val failed_loads     = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B))) // Loads which we will report as failures (throws a mini-exception)
-  val nacking_loads    = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B))) // Loads which are being nacked by dcache in the next stage
+  val failed_loads  = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B))) // Loads which we will report as failures (throws a mini-exception)
+  val nacking_loads = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B))) // Loads which are being nacked by dcache in the next stage
 
   val s1_executing_loads = RegNext(s0_executing_loads)
   val s1_set_execute     = WireInit(s1_executing_loads)
 
   val mem_forward_valid   = Wire(Vec(memWidth, Bool()))
+  val mem_forward_is_rfp  = Wire(Vec(memWidth, Bool()))
   val mem_forward_ldq_idx = lcam_ldq_idx
   val mem_forward_ld_addr = lcam_addr
   val mem_forward_stq_idx = Wire(Vec(memWidth, UInt(log2Ceil(numStqEntries).W)))
 
-  val wb_forward_valid    = RegNext(mem_forward_valid)
-  val wb_forward_ldq_idx  = RegNext(mem_forward_ldq_idx)
-  val wb_forward_ld_addr  = RegNext(mem_forward_ld_addr)
-  val wb_forward_stq_idx  = RegNext(mem_forward_stq_idx)
+  val wb_forward_valid   = RegNext(mem_forward_valid)
+  val wb_forward_is_rfp  = RegNext(mem_forward_is_rfp)
+  val wb_forward_ldq_idx = RegNext(mem_forward_ldq_idx)
+  val wb_forward_ld_addr = RegNext(mem_forward_ld_addr)
+  val wb_forward_stq_idx = RegNext(mem_forward_stq_idx)
 
   for (i <- 0 until numLdqEntries) {
     val l_valid = ldq(i).valid
@@ -1180,7 +1322,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       when (do_release_search(w) &&
             l_valid              &&
             l_bits.addr.valid    &&
-            block_addr_matches(w)) {
+            block_addr_matches(w)   )
+      {
         // This load has been observed, so if a younger load to the same address has not
         // executed yet, this load must be squashed
         ldq(i).bits.observed := true.B
@@ -1279,6 +1422,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                   (ldst_forward_matches(w)(forwarding_idx(w))        &&
                                  !IsKilledByBranch(io.core.brupdate, lcam_uop(w))    &&
                                  !io.core.exception && !RegNext(io.core.exception)))
+  mem_forward_is_rfp      := widthMap(w => lcam_uop(w).is_rfp)
   mem_forward_stq_idx     := forwarding_idx
 
   // Avoid deadlock with a 1-w LSU prioritizing load wakeups > store commits
@@ -1288,7 +1432,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // Wakeups may repeatedly find a st->ld addr conflict and fail to forward,
     // repeated wakeups may block the store from ever committing
     // Disallow load wakeups 1 cycle after this happens to allow the stores to drain
-    when (RegNext(ldst_addr_matches(0).reduce(_||_) && !mem_forward_valid(0))) {
+    when (RegNext(ldst_addr_matches(0).reduce(_||_) && !mem_forward_valid(0) && !mem_forward_is_rfp(0))) {
       block_load_wakeup := true.B
     }
 
@@ -1393,16 +1537,20 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       }
         .elsewhen (io.dmem.nack(w).bits.uop.uses_ldq)
       {
-        assert(ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.executed)
-        ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.executed  := false.B
+        assert(ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.executed, "[lsu] NACKed load not marked as executed")
+        ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.executed := false.B
         nacking_loads(io.dmem.nack(w).bits.uop.ldq_idx) := true.B
-      }
+      } 
         .otherwise
       {
         assert(io.dmem.nack(w).bits.uop.uses_stq)
         when (IsOlder(io.dmem.nack(w).bits.uop.stq_idx, stq_execute_head, stq_head)) {
           stq_execute_head := io.dmem.nack(w).bits.uop.stq_idx
         }
+      }
+
+      when (io.dmem.nack(w).bits.uop.uses_ldq && io.dmem.nack(w).bits.uop.is_rfp) {
+        ldq(io.dmem.nack(w).bits.uop.ldq_idx).bits.rfp_fired := false.B
       }
     }
 
@@ -1427,9 +1575,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         case true => io.core.tsc_reg - io.dmem.resp(w).bits.uop.memory_latency.getOrElse(io.core.tsc_reg)
         case _ => DontCare
       }
-      when (io.dmem.resp(w).bits.uop.uses_ldq)
+      when (io.dmem.resp(w).bits.uop.uses_ldq && !io.dmem.resp(w).bits.uop.is_rfp)
       {
-        assert(!io.dmem.resp(w).bits.is_hella)
+        assert(!io.dmem.resp(w).bits.is_hella, "[lsu] is_hella when uses_ldq")
         val ldq_idx = io.dmem.resp(w).bits.uop.ldq_idx
         val send_iresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FIX
         val send_fresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FLT
@@ -1452,9 +1600,44 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         ldq(ldq_idx).bits.succeeded      := io.core.exe(w).iresp.valid || io.core.exe(w).fresp.valid
         ldq(ldq_idx).bits.debug_wb_data  := io.dmem.resp(w).bits.data
       }
+        .elsewhen (io.dmem.resp(w).bits.uop.uses_ldq && io.dmem.resp(w).bits.uop.is_rfp)
+      {
+        // NOTE RFP: Got response from dcache and it was a prediction
+        // Write data back into LDQ
+        val ldq_idx = io.dmem.resp(w).bits.uop.ldq_idx
+        when (!ldq(ldq_idx).bits.rfp_was_forwarded) {
+          ldq(ldq_idx).bits.pred_val.valid := true.B
+          ldq(ldq_idx).bits.pred_val.bits  := io.dmem.resp(w).bits.data
+        }
+
+        // When marked as correct, or will be marked as correct
+        when (rfp_correct(ldq_idx)) {
+          val send_iresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FIX
+          val send_fresp = ldq(ldq_idx).bits.uop.dst_rtype === RT_FLT
+
+          io.core.exe(w).iresp.bits.uop  := ldq(ldq_idx).bits.uop
+          io.core.exe(w).fresp.bits.uop  := ldq(ldq_idx).bits.uop
+          io.core.exe(w).iresp.valid     := send_iresp
+          io.core.exe(w).iresp.bits.data := io.dmem.resp(w).bits.data
+          io.core.exe(w).fresp.valid     := send_fresp
+          io.core.exe(w).fresp.bits.data := io.dmem.resp(w).bits.data
+
+          io.core.exe(w).iresp.bits.uop.tea_psv.dcache_miss := io.dmem.resp(w).bits.uop.tea_psv.dcache_miss
+          io.core.exe(w).iresp.bits.uop.memory_latency.foreach(_ := memory_latency)
+          io.core.exe(w).fresp.bits.uop.tea_psv.dcache_miss := io.dmem.resp(w).bits.uop.tea_psv.dcache_miss
+          io.core.exe(w).fresp.bits.uop.memory_latency.foreach(_ := memory_latency)
+
+          assert(send_iresp ^ send_fresp)
+          dmem_resp_fired(w) := true.B
+
+          ldq(ldq_idx).bits.succeeded      := io.core.exe(w).iresp.valid || io.core.exe(w).fresp.valid
+          ldq(ldq_idx).bits.debug_wb_data  := io.dmem.resp(w).bits.data
+          ldq(ldq_idx).bits.rfp_resp_sent  := io.core.exe(w).iresp.valid || io.core.exe(w).fresp.valid
+        }
+      }
         .elsewhen (io.dmem.resp(w).bits.uop.uses_stq)
       {
-        assert(!io.dmem.resp(w).bits.is_hella)
+        assert(!io.dmem.resp(w).bits.is_hella, "[lsu] is_hella when uses_stq")
         stq(io.dmem.resp(w).bits.uop.stq_idx).bits.succeeded := true.B
         when (io.dmem.resp(w).bits.uop.is_amo) {
           dmem_resp_fired(w) := true.B
@@ -1470,12 +1653,35 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       }
     }
 
+    // We may have capacity to send some unsent rfps
+    val (ldq_sendable_rfp_idx, ldq_sendable_rfp_valid) = ldq_next_sendable_rfp_idx(!dmem_resp_fired(w) && !wb_forward_valid(w))
+    when (ldq_sendable_rfp_valid) {
+      val ldq_idx = ldq_sendable_rfp_idx
+      val ldq_e = ldq(ldq_idx)
+      val send_iresp = ldq_e.bits.uop.dst_rtype === RT_FIX
+      val send_fresp = ldq_e.bits.uop.dst_rtype === RT_FLT
+
+      io.core.exe(w).iresp.bits.uop  := ldq_e.bits.uop
+      io.core.exe(w).fresp.bits.uop  := ldq_e.bits.uop
+      io.core.exe(w).iresp.valid     := send_iresp
+      io.core.exe(w).iresp.bits.data := ldq_e.bits.pred_val.bits
+      io.core.exe(w).fresp.valid     := send_fresp
+      io.core.exe(w).fresp.bits.data := ldq_e.bits.pred_val.bits
+
+      assert(send_iresp ^ send_fresp)
+
+      ldq(ldq_idx).bits.succeeded     := io.core.exe(w).iresp.valid || io.core.exe(w).fresp.valid
+      ldq(ldq_idx).bits.debug_wb_data := io.dmem.resp(w).bits.data
+      ldq(ldq_idx).bits.rfp_resp_sent := io.core.exe(w).iresp.valid || io.core.exe(w).fresp.valid
+    }
+    dontTouch(ldq_sendable_rfp_idx)
+
 
     when (dmem_resp_fired(w) && wb_forward_valid(w))
     {
       // Twiddle thumbs. Can't forward because dcache response takes precedence
     }
-      .elsewhen (!dmem_resp_fired(w) && wb_forward_valid(w))
+      .elsewhen (!dmem_resp_fired(w) && wb_forward_valid(w) && !wb_forward_is_rfp(w))
     {
       val f_idx       = wb_forward_ldq_idx(w)
       val forward_uop = ldq(f_idx).bits.uop
@@ -1487,7 +1693,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                 stq_e.bits.data.bits, coreDataBytes)
       val loadgen  = new freechips.rocketchip.rocket.LoadGen(
                                 forward_uop.mem_size, forward_uop.mem_signed,
-                                wb_forward_ld_addr(w),
+                                wb_forward_ld_addr(w), // I'm not sure this matters here either
                                 storegen.data, false.B, coreDataBytes)
 
       io.core.exe(w).iresp.valid := (forward_uop.dst_rtype === RT_FIX) && data_ready && live
@@ -1510,13 +1716,46 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
             instrFromUOp(forward_uop)
           )
         }
-        ldq(f_idx).bits.succeeded := data_ready
+        ldq(f_idx).bits.succeeded := data_ready // This is always true???
         ldq(f_idx).bits.forward_std_val := true.B
         ldq(f_idx).bits.forward_stq_idx := wb_forward_stq_idx(w)
-
         ldq(f_idx).bits.debug_wb_data   := loadgen.data
       }
     }
+
+    when (wb_forward_valid(w) && wb_forward_is_rfp(w)) {
+      val ldq_idx = wb_forward_ldq_idx(w)
+      val fwd_uop = ldq(ldq_idx).bits.uop
+      val stq_e = stq(wb_forward_stq_idx(w))
+      val data_ready = stq_e.bits.data.valid
+      val live = !IsKilledByBranch(io.core.brupdate, fwd_uop)
+
+      val storegen = new freechips.rocketchip.rocket.StoreGen(
+        stq_e.bits.uop.mem_size,
+        stq_e.bits.addr.bits,
+        stq_e.bits.data.bits,
+        coreDataBytes
+      )
+
+      val loadgen = new freechips.rocketchip.rocket.LoadGen(
+        fwd_uop.mem_size,
+        fwd_uop.mem_signed,
+        wb_forward_ld_addr(w), // I don't think this actually matters here?
+        storegen.data,
+        false.B,
+        coreDataBytes
+      )
+
+      when (data_ready && live) {
+        assert(ldq(ldq_idx).valid)
+        ldq(ldq_idx).bits.rfp_was_forwarded := true.B
+        ldq(ldq_idx).bits.pred_val.valid := true.B
+        ldq(ldq_idx).bits.pred_val.bits := loadgen.data
+        ldq(ldq_idx).bits.forward_std_val := true.B
+        ldq(ldq_idx).bits.forward_stq_idx := wb_forward_stq_idx(w)
+      }
+    }
+
   }
 
   // Initially assume the speculative load wakeup failed
@@ -1586,6 +1825,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // dequeue old entries on commit
   //-------------------------------------------------------------
   //-------------------------------------------------------------
+
+  for (w <- 0 until coreWidth) {
+    when (io.core.rfp.ldq_idx(w).valid) {
+      val idx = io.core.rfp.ldq_idx(w).bits
+      io.core.rfp.ldq_entry(w) := ldq(idx).bits
+    }
+  }
 
   var temp_stq_commit_head = stq_commit_head
   var temp_ldq_head        = ldq_head

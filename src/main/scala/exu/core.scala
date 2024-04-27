@@ -142,6 +142,10 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   val int_ren_wakeups  = Wire(Vec(numIntRenameWakeupPorts, Valid(new ExeUnitResp(xLen))))
   val pred_wakeup  = Wire(Valid(new ExeUnitResp(1)))
 
+  val rfp = Module(new boom.lsu.Rfp)
+  rfp.io.lsu <> io.lsu.rfp
+  rfp.io.commit := rob.io.commit
+
   require (exe_units.length == issue_units.map(_.issueWidth).sum)
 
   //***********************************
@@ -497,9 +501,15 @@ class BoomCore(usingTrace: Boolean)(implicit p: Parameters) extends BoomModule
   // Decoders
 
   for (w <- 0 until coreWidth) {
-    dec_valids(w)                      := io.ifu.fetchpacket.valid && dec_fbundle.uops(w).valid &&
-                                          !dec_finished_mask(w)
-    decode_units(w).io.enq.uop         := dec_fbundle.uops(w).bits
+    val valid = io.ifu.fetchpacket.valid && dec_fbundle.uops(w).valid && !dec_finished_mask(w)
+    val bits  = dec_fbundle.uops(w).bits
+
+    // NOTE RFP: Feed uops into predictor
+    rfp.io.enq_uops(w).valid := valid
+    rfp.io.enq_uops(w).bits  := bits
+
+    dec_valids(w)                      := valid
+    decode_units(w).io.enq.uop         := bits
     decode_units(w).io.status          := csr.io.status
     decode_units(w).io.csr_decode      <> csr.io.decode(w)
     decode_units(w).io.interrupt       := csr.io.interrupt

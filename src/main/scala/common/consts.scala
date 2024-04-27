@@ -268,6 +268,7 @@ trait ScalarOpConstants
   def NullMicroOp()(implicit p: Parameters): boom.common.MicroOp = {
     val uop = Wire(new boom.common.MicroOp)
     uop            := DontCare // Overridden in the following lines
+    uop.is_rfp     := false.B
     uop.uopc       := uopNOP // maybe not required, but helps on asserts that try to catch spurious behavior
     uop.bypassable := false.B
     uop.fp_val     := false.B
