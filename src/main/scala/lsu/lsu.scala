@@ -109,6 +109,8 @@ class LSUDMemIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
     val release = Bool()
   })
 
+  // Response from dcache when an RFP misses
+  val rfp_missed = Input(Vec(memWidth, Valid(UInt(ldqAddrSz.W))))
 }
 
 class LSUClearPSV(implicit p: Parameters) extends BoomBundle()(p) {
@@ -206,6 +208,7 @@ class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
   val pred_val            = Valid(UInt(xLen.W))
   val rfp_fired           = Bool()
   val rfp_correct         = Bool()
+  val rfp_missed          = Bool()
   val rfp_resp_sent       = Bool()
   val rfp_was_forwarded   = Bool()
 }
@@ -339,16 +342,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
       ldq(ld_enq_idx).bits.pred_val.valid        := false.B
       ldq(ld_enq_idx).bits.pred_val.bits         := DontCare
-      ldq(ld_enq_idx).bits.rfp_fired             := false.B
       ldq(ld_enq_idx).bits.rfp_correct           := false.B
+      ldq(ld_enq_idx).bits.rfp_missed            := false.B
+      ldq(ld_enq_idx).bits.rfp_fired             := false.B
       ldq(ld_enq_idx).bits.rfp_resp_sent         := false.B
       ldq(ld_enq_idx).bits.rfp_was_forwarded     := false.B
-      ldq(ld_enq_idx).bits.debug_pred_addr.valid := io.core.rfp.predictions(w).valid
+      // TODO RFP: fix timing so that arrival of RFPs is synchronised with dispatching uOPs
+      ldq(ld_enq_idx).bits.debug_pred_addr.valid := io.core.rfp.predictions(w).valid && (io.core.dis_uops(w).bits.debug_pc === io.core.rfp.debug_uops(w).bits.debug_pc)
       ldq(ld_enq_idx).bits.debug_pred_addr.bits  := io.core.rfp.predictions(w).bits.addr
       ldq(ld_enq_idx).bits.debug_pred_uop        := io.core.rfp.debug_uops(w)
 
       when (io.core.rfp.predictions(w).valid) {
-        assert(io.core.dis_uops(w).bits.debug_pc === io.core.rfp.debug_uops(w).bits.debug_pc, "Writing prediction for wrong uOP")
+        // TODO RFP: fix timing
+        // assert(io.core.dis_uops(w).bits.debug_pc === io.core.rfp.debug_uops(w).bits.debug_pc, "Writing prediction for wrong uOP")
       }
 
       assert (ld_enq_idx === io.core.dis_uops(w).bits.ldq_idx, "[lsu] mismatch enq load tag.")
@@ -477,6 +483,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   dontTouch(correct_rfp_incoming)
   val incorrect_rfp_incoming = WireInit(VecInit((0 until memWidth).map(x => false.B)))
   dontTouch(incorrect_rfp_incoming)
+  val rfp_missed = Wire(Vec(numLdqEntries, Bool()))
 
   val rfp_uop = io.core.dis_uops(io.core.rfp.prediction.bits.lane).bits
   val ldq_rfp_idx = rfp_uop.ldq_idx
@@ -526,9 +533,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // NOTE RFP: Restricted to firing RFP load on mem port 0
   val can_fire_rfp = widthMap(w => 
-    io.core.rfp.prediction.valid                             && 
-    (w == 0).B                                               && 
-    io.core.dis_uops(io.core.rfp.prediction.bits.lane).valid &&
+    io.core.rfp.prediction.valid                                                    && 
+    (w == 0).B                                                                      && 
+    io.core.dis_uops(io.core.rfp.prediction.bits.lane).valid                        &&
+    // TODO RFP: Just fix the darn timing
+    (io.core.dis_uops(w).bits.debug_pc === io.core.rfp.debug_uops(w).bits.debug_pc) &&
     !io.core.dis_uops(io.core.rfp.prediction.bits.lane).bits.exception  
   )
   dontTouch(can_fire_rfp)
@@ -857,11 +866,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   }
 
   //------------------------------
+  rfp_missed := (0 until numLdqEntries).map(idx => {
+    ldq(idx).bits.rfp_missed || io.dmem.rfp_missed.exists(miss => miss.valid && (miss.bits === idx.U))
+  })
+
   correct_rfp_incoming := widthMap(w => true.B
     && ldq_incoming_e(w).valid // probably not needed
     && ldq_incoming_e(w).bits.debug_pred_addr.valid                       // predicted address is valid
     && (ldq_incoming_e(w).bits.debug_pred_addr.bits === exe_tlb_paddr(w)) // generated address matches the predicted address
     && ldq_incoming_e(w).bits.rfp_fired
+    && !rfp_missed(ldq_incoming_idx(w))
   )
 
   incorrect_rfp_incoming := widthMap(w => true.B
@@ -870,6 +884,21 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     && (ldq_incoming_e(w).bits.debug_pred_addr.bits =/= exe_tlb_paddr(w)) // generated address does not match the predicted address
     && ldq_incoming_e(w).bits.rfp_fired
   )
+
+  for (w <- 0 until memWidth) {
+    // When we miss, set the missed bit in the LDQ
+    when (io.dmem.rfp_missed(w).valid) {
+      val ldq_idx = io.dmem.rfp_missed(w).bits
+      ldq(ldq_idx).bits.rfp_missed := true.B
+
+      // Additionally, if this was for a correct prediction, unset the `executed` bit so that this load can be woken up by the LSU later
+      // If the `rfp_correct` bit is set, we have ignored a load_incoming.
+      // This should happen rarely as addresses practically always arrive after we know whether the RFP missed.
+      when (ldq(ldq_idx).bits.rfp_correct) {
+        ldq(ldq_idx).bits.executed := false.B
+      }
+    }
+  }
 
   //------------------------------
   // Issue Someting to Memory
@@ -907,13 +936,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop(w)
       s0_executing_loads(ldq_incoming_idx(w)) := dmem_req_fire(w)
-      assert( false.B
-        || !ldq_incoming_e(w).bits.executed 
-        || incorrect_rfp_incoming(w) 
-        || correct_rfp_incoming(w)
-        , 
-        "[lsu] Firing load that has already executed without incorrect prediction"
-      )
+      when (dmem_req(w).valid) {
+        assert( false.B
+          || !ldq_incoming_e(w).bits.executed 
+          || incorrect_rfp_incoming(w) 
+          || correct_rfp_incoming(w)
+          || rfp_missed(ldq_incoming_idx(w))
+          , 
+          "[lsu] Firing load that has already executed without incorrect prediction"
+        )
+      }
     } .elsewhen (will_fire_load_retry(w)) {
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)

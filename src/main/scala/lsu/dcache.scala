@@ -758,18 +758,21 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
   // Miss handling
   for (w <- 0 until memWidth) {
-    mshrs.io.req(w).valid := s2_valid(w)          &&
-                            !s2_hit(w)            &&
-                            !s2_nack_hit(w)       &&
-                            !s2_nack_victim(w)    &&
-                            !s2_nack_data(w)      &&
-                            !s2_nack_wb(w)        &&
-                             s2_type.isOneOf(t_lsu, t_prefetch)             &&
-                            !IsKilledByBranch(io.lsu.brupdate, s2_req(w).uop) &&
-                            !(io.lsu.exception && s2_req(w).uop.uses_ldq)   &&
-                             (isPrefetch(s2_req(w).uop.mem_cmd) ||
-                              isRead(s2_req(w).uop.mem_cmd)     ||
-                              isWrite(s2_req(w).uop.mem_cmd))
+    val missed = s2_valid(w)          &&
+                !s2_hit(w)            &&
+                !s2_nack_hit(w)       &&
+                !s2_nack_victim(w)    &&
+                !s2_nack_data(w)      &&
+                !s2_nack_wb(w)        &&
+                 s2_type.isOneOf(t_lsu, t_prefetch)             &&
+                !IsKilledByBranch(io.lsu.brupdate, s2_req(w).uop) &&
+                !(io.lsu.exception && s2_req(w).uop.uses_ldq)   &&
+                 (isPrefetch(s2_req(w).uop.mem_cmd) ||
+                  isRead(s2_req(w).uop.mem_cmd)     ||
+                  isWrite(s2_req(w).uop.mem_cmd))
+
+    mshrs.io.req(w).valid := missed && !s2_req(w).uop.is_rfp // Don't actually set up MSHRs for missed RFPs
+
     assert(!(mshrs.io.req(w).valid && s2_type === t_replay), "Replays should not need to go back into MSHRs")
     mshrs.io.req(w).bits             := DontCare
     mshrs.io.req(w).bits.uop         := s2_req(w).uop
@@ -785,6 +788,14 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
     mshrs.io.req(w).bits.is_hella_prft := s2_req(w).is_hella_prft
     mshrs.io.req(w).bits.uop.tea_psv.dcache_miss := true.B
+
+    io.lsu.rfp_missed(w).valid := false.B
+    io.lsu.rfp_missed(w).bits := DontCare
+    when (missed && s2_req(w).uop.is_rfp) {
+      val ldq_idx = s2_req(w).uop.ldq_idx
+      io.lsu.rfp_missed(w).valid := true.B
+      io.lsu.rfp_missed(w).bits := ldq_idx
+    }
   }
 
   if (DEBUG_PRINTF) {
