@@ -201,9 +201,9 @@ class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
 
   // === RFP fields ===
   // A separate field for the predicted address (This should be shared with addr in a real implementation)
-  val debug_pred_addr     = Valid(UInt(coreMaxAddrBits.W))
+  val debug_rfp_addr     = Valid(UInt(coreMaxAddrBits.W))
   // The uop that triggered this prediction
-  val debug_pred_uop      = Valid(new MicroOp())
+  val debug_rfp_uop      = Valid(new MicroOp())
   // Whether the address in this entry is for a prefetch
   val pred_val            = Valid(UInt(xLen.W))
   val rfp_fired           = Bool()
@@ -348,9 +348,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(ld_enq_idx).bits.rfp_resp_sent         := false.B
       ldq(ld_enq_idx).bits.rfp_was_forwarded     := false.B
       // TODO RFP: fix timing so that arrival of RFPs is synchronised with dispatching uOPs
-      ldq(ld_enq_idx).bits.debug_pred_addr.valid := io.core.rfp.predictions(w).valid && (io.core.dis_uops(w).bits.debug_pc === io.core.rfp.debug_uops(w).bits.debug_pc)
-      ldq(ld_enq_idx).bits.debug_pred_addr.bits  := io.core.rfp.predictions(w).bits.addr
-      ldq(ld_enq_idx).bits.debug_pred_uop        := io.core.rfp.debug_uops(w)
+      ldq(ld_enq_idx).bits.debug_rfp_addr.valid := io.core.rfp.predictions(w).valid && (io.core.dis_uops(w).bits.debug_pc === io.core.rfp.debug_uops(w).bits.debug_pc)
+      ldq(ld_enq_idx).bits.debug_rfp_addr.bits  := io.core.rfp.predictions(w).bits.addr
+      ldq(ld_enq_idx).bits.debug_rfp_uop        := io.core.rfp.debug_uops(w)
 
       when (io.core.rfp.predictions(w).valid) {
         // TODO RFP: fix timing
@@ -520,11 +520,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Determine what can fire
 
   // Can we fire a incoming load
-  // NOTE RFP: We will not fire loads to the dcache for correctly predicted loads
   val can_fire_load_incoming = widthMap(w => true.B
     && exe_req(w).valid 
     && exe_req(w).bits.uop.ctrl.is_load
-    // && !correct_rfp_incoming(w) // Don't fire when the prediction is correct
   )
 
   // Can we fire an incoming store addrgen + store datagen
@@ -541,6 +539,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     !io.core.dis_uops(io.core.rfp.prediction.bits.lane).bits.exception  
   )
   dontTouch(can_fire_rfp)
+
+  for (w <- 0 until memWidth) {
+    when (can_fire_rfp(w)) {
+      assert(io.core.dis_uops(w).bits.debug_pc === io.core.rfp.debug_uops(w).bits.debug_pc)
+    }
+  }
 
  // Can we fire an incoming store addrgen
   val can_fire_sta_incoming  = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_sta
@@ -656,10 +660,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     will_fire_std_incoming  (w) := lsu_sched(can_fire_std_incoming  (w) , false, false, false, true)  //                 , ROB
     will_fire_sfence        (w) := lsu_sched(can_fire_sfence        (w) , true , false, false, true)  // TLB ,    ,      , ROB
     will_fire_release       (w) := lsu_sched(can_fire_release       (w) , false, false, true , false) //            LCAM
+
+    will_fire_rfp           (w) := lsu_sched(can_fire_rfp           (w) , false, true , true , false) //     , DC , LCAM
+
     will_fire_hella_incoming(w) := lsu_sched(can_fire_hella_incoming(w) , true , true , false, false) // TLB , DC
     will_fire_hella_wakeup  (w) := lsu_sched(can_fire_hella_wakeup  (w) , false, true , false, false) //     , DC
     will_fire_load_retry    (w) := lsu_sched(can_fire_load_retry    (w) , true , true , true , false) // TLB , DC , LCAM
-    will_fire_rfp           (w) := lsu_sched(can_fire_rfp           (w) , false, true , true , false) //     , DC , LCAM
     will_fire_sta_retry     (w) := lsu_sched(can_fire_sta_retry     (w) , true , false, true , true)  // TLB ,    , LCAM , ROB // TODO: This should be higher priority
     will_fire_load_wakeup   (w) := lsu_sched(can_fire_load_wakeup   (w) , false, true , true , false) //     , DC , LCAM1
     will_fire_store_commit  (w) := lsu_sched(can_fire_store_commit  (w) , false, true , false, false) //     , DC
@@ -872,16 +878,18 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   correct_rfp_incoming := widthMap(w => true.B
     && ldq_incoming_e(w).valid // probably not needed
-    && ldq_incoming_e(w).bits.debug_pred_addr.valid                       // predicted address is valid
-    && (ldq_incoming_e(w).bits.debug_pred_addr.bits === exe_tlb_paddr(w)) // generated address matches the predicted address
+    && will_fire_load_incoming(w)
+    && ldq_incoming_e(w).bits.debug_rfp_addr.valid                       // predicted address is valid
+    && (ldq_incoming_e(w).bits.debug_rfp_addr.bits === exe_tlb_paddr(w)) // generated address matches the predicted address
+    && !exe_tlb_miss(w)
     && ldq_incoming_e(w).bits.rfp_fired
     && !rfp_missed(ldq_incoming_idx(w))
   )
 
   incorrect_rfp_incoming := widthMap(w => true.B
     && ldq_incoming_e(w).valid // probably not needed
-    && ldq_incoming_e(w).bits.debug_pred_addr.valid                       // predicted address is valid
-    && (ldq_incoming_e(w).bits.debug_pred_addr.bits =/= exe_tlb_paddr(w)) // generated address does not match the predicted address
+    && ldq_incoming_e(w).bits.debug_rfp_addr.valid                       // predicted address is valid
+    && (ldq_incoming_e(w).bits.debug_rfp_addr.bits =/= exe_tlb_paddr(w)) // generated address does not match the predicted address
     && ldq_incoming_e(w).bits.rfp_fired
   )
 
@@ -917,6 +925,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val dmem_req = Wire(Vec(memWidth, Valid(new BoomDCacheReq)))
   io.dmem.req.valid := dmem_req.map(_.valid).reduce(_||_)
   io.dmem.req.bits  := dmem_req
+
   val dmem_req_fire = widthMap(w => dmem_req(w).valid && io.dmem.req.fire)
 
   val s0_executing_loads = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B)))
@@ -932,18 +941,31 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     io.dmem.s1_kill(w) := false.B
 
     when (will_fire_load_incoming(w)) {
-      dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w) && !correct_rfp_incoming(w)
+      val ldq_idx = exe_tlb_uop(w).ldq_idx
+      dmem_req(w).valid := (
+        !exe_tlb_miss(w) && 
+        !exe_tlb_uncacheable(w) && 
+        !correct_rfp_incoming(w) &&
+        // !ldq(ldq_idx).bits.rfp_correct &&
+        true.B
+      )
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop(w)
+
       s0_executing_loads(ldq_incoming_idx(w)) := dmem_req_fire(w)
+
       when (dmem_req(w).valid) {
+        // Need this because the load can be nacked, but we don't reset it when the RFP misses or is incorrect
+        // Reset it here instead
+        ldq(ldq_idx).bits.executed := false.B
+
         assert( false.B
           || !ldq_incoming_e(w).bits.executed 
           || incorrect_rfp_incoming(w) 
           || correct_rfp_incoming(w)
           || rfp_missed(ldq_incoming_idx(w))
           , 
-          "[lsu] Firing load that has already executed without incorrect prediction"
+          "[lsu] Firing load that has already executed without incorrect or missed prediction"
         )
       }
     } .elsewhen (will_fire_load_retry(w)) {
@@ -951,7 +973,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop(w)
       s0_executing_loads(ldq_retry_idx) := dmem_req_fire(w)
-      assert(!ldq_retry_e.bits.executed, "[lsu] Retrying load that's already executed")
+      when (dmem_req_fire(w)) {
+        val ldq_idx = ldq_retry_idx
+        ldq(ldq_idx).bits.executed := false.B
+        // Might retry load that is executed, but is set as such because of RFP
+        // assert(!ldq_retry_e.bits.executed, "[lsu] Retrying load that's already executed")
+        // TODO RFP: Get a useful assert here
+      }
     } .elsewhen (will_fire_store_commit(w)) {
       dmem_req(w).valid         := true.B
       dmem_req(w).bits.addr     := stq_commit_e.bits.addr.bits
@@ -1637,6 +1665,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         // NOTE RFP: Got response from dcache and it was a prediction
         // Write data back into LDQ
         val ldq_idx = io.dmem.resp(w).bits.uop.ldq_idx
+        assert(io.dmem.resp(w).bits.uop.debug_pc === ldq(ldq_idx).bits.debug_rfp_uop.bits.debug_pc)
+        // assert(io.dmem.resp(w).bits.ldq_idx === ldq_idx)
         when (!ldq(ldq_idx).bits.rfp_was_forwarded) {
           ldq(ldq_idx).bits.pred_val.valid := true.B
           ldq(ldq_idx).bits.pred_val.bits  := io.dmem.resp(w).bits.data

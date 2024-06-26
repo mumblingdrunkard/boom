@@ -114,7 +114,15 @@ class Rfp(implicit p: Parameters) extends BoomModule()(p) {
     val commit_uop = io.commit.uops(w)
     val ldq_e = io.lsu.ldq_entry(w)
 
-    when (commit_valid && commit_uop.uses_ldq && !commit_uop.uses_stq && !ldq_e.addr_is_uncacheable) {
+    when (true.B 
+      && commit_valid 
+      && commit_uop.uses_ldq 
+      && !commit_uop.uses_stq 
+      && !ldq_e.addr_is_uncacheable 
+      // TODO Fix this
+      && !(addr(31) === 1.U && addr(15, 0) === 0x1040.U) // Don't train on the fromhost address
+      && !(addr(31) === 1.U && addr(15, 0) === 0x1000.U) // Don't train on the tohost address
+    ) {
       tags(bank)(idx).bits := tag
       tags(bank)(idx).valid := true.B
 
@@ -148,7 +156,6 @@ class Rfp(implicit p: Parameters) extends BoomModule()(p) {
     // true when the prediction_addr is in the same page as the previously accessed value
     val prediction_same_page = prediction_prev(coreMaxAddrBits - 1, 12) === prediction_addr(coreMaxAddrBits - 1, 12)
 
-    // prediction_addr is only valid when it's within the same page
     val prediction_valid = ( true.B
       && prediction_hit 
       && prediction_same_page 
@@ -171,7 +178,7 @@ class Rfp(implicit p: Parameters) extends BoomModule()(p) {
   })
 
   val lane = predictions.indexWhere((p: Valid[Prediction]) => {
-    p.valid === select.valid && p.bits.confidence === select.bits.confidence && p.bits.addr === select.bits.addr
+    (p.valid === select.valid) && p.bits.confidence === select.bits.confidence && p.bits.addr === select.bits.addr
   })
 
   val prediction = predictions(lane)

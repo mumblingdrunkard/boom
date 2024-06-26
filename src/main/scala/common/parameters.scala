@@ -39,7 +39,7 @@ case class BoomCoreParams(
   numFetchBufferEntries: Int = 16,
   enableAgePriorityIssue: Boolean = true,
   enablePrefetching: Boolean = false,
-  enableFastLoadUse: Boolean = true,
+  enableFastLoadUse: Boolean = false, // Disabled to make cache access longer
   enableCommitMapTable: Boolean = false,
   enableFastPNR: Boolean = false,
   enableSFBOpt: Boolean = false,
@@ -98,7 +98,7 @@ case class BoomCoreParams(
   scontextWidth: Int = 0,
 
   /* debug stuff */
-  enableCommitLogPrintf: Boolean = false,
+  enableCommitLogPrintf: Boolean = true,
   enableBranchPrintf: Boolean = false,
   enableMemtracePrintf: Boolean = false,
 

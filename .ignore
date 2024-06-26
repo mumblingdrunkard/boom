@@ -1,0 +1,5 @@
+/target
+/docs
+/src/test
+# /src/main/resources
+# /src/main/scala/common

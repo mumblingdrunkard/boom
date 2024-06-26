@@ -85,6 +85,7 @@ class ExecutionUnits(val fpu: Boolean)(implicit val p: Parameters) extends HasBo
   }
 
   lazy val fpiu_unit = {
+
     require (usingFPU)
     require (exe_units.count(_.hasFpiu) == 1)
     exe_units.find(_.hasFpiu).get
